@@ -1,0 +1,199 @@
+---
+title: "5. NNAR Application"
+date: "ECO374H1"
+output: pdf_document
+urlcolor: blue
+geometry: margin=0.75in
+---
+ 
+\vspace{-0.1in}
+Install and load required packages
+```{r, message=FALSE}
+if (!require("quantmod")) install.packages("quantmod")
+if (!require("stats")) install.packages("stats") 
+if (!require("forecast")) install.packages("forecast")  # Neural Networks
+if (!require("timetk")) install.packages("timetk")
+if (!require("ggplot2")) install.packages("ggplot2") 
+library(quantmod) # functions: getSymbols
+library(stats)    # functions: arima, predict
+library(forecast) # functions: nnetar
+library(timetk)   # functions: tk_index, tk_make_future_timeseries
+library(ggplot2)  # functions: ggplot
+```
+
+# 1. Data
+
+Data: iShares Core S&P Total U.S. Stock Market ETF ([Source](https://finance.yahoo.com/quote/ITOT/))
+```{r, message=FALSE}
+ITOT <- getSymbols("ITOT", src="yahoo", return.class="xts", auto.assign=F)
+ITOT <- window(ITOT, start=as.Date("2022-11-01"), end=as.Date("2023-09-01"))
+ITOT.c <- ITOT$ITOT.Close # extract close price
+```
+
+Plot data 
+```{r, fig.width=7, fig.height=3}
+ggplot(ITOT.c, aes(x=index(ITOT.c), y=ITOT.Close)) + geom_line(color="springgreen4") + 
+  labs(x="", y="", title="Core S&P Total U.S. Stock Market, Close") + 
+  theme_minimal() + theme(plot.title = element_text(size=10)) +
+  scale_x_date(date_breaks="1 months", date_labels = "%Y-%m") 
+```
+
+# 2. Neural Network (FFN) Autoregression
+
+The nnetar() function from R package "forecast" specifies a feed-forward neural network with lagged values of y as inputs and 1 hidden layer. The function fits an NNAR(p,P,size)m model. 
+
+- p is the number of non-seasonal lags used as inputs.    
+- P is the number of seasonal lags used as inputs.     
+- size is the number of nodes in the hidden layer (there is only one hidden layer by default).    
+- m = frequency(y) is the automatically determined seasonal frequency of the data.    
+
+If the values of p and P are not specified, nnetar() runs the default model.     
+For p the default is the optimal number of lags (according to the AIC) for a linear AR(p) model.     
+For size the default is size=(p+P+1)/2 (rounded to the nearest integer).    
+
+Fit an NNAR model 
+```{r}
+seed <- 2345
+set.seed(seed)
+nnetar.model <- nnetar(y=ITOT.c, p=2, P=0, size=2) # fit nnetar model on the training set
+nnetar.model
+```
+
+Forecast with the fitted model
+```{r}
+y.hat <- forecast(nnetar.model, h=1) # generate forecast 1 time step ahead
+y.hat$mean
+```
+
+Plot data and 1-step ahead in-sample forecast, starting at 20% of the sample
+```{r, fig.width=7, fig.height=3}
+data <- ITOT.c
+TT <- length(data)
+T1 <- floor(0.2*TT) # start at 20% of the sample size
+y.hat <- matrix(0,nrow=TT-T1+1,ncol=1) # initialize
+
+for (j in T1:TT) {
+  #print(j) # display progress through data
+  nnetar.model <- nnetar(y=data[1:j-1], p=1, P=0, size=2) # fit nnetar model on the training set
+  NN.f <- forecast(nnetar.model,h=1) # generate forecast 1 time step ahead
+  y.hat[j-T1+1] <- as.numeric(NN.f$mean)
+}
+
+ITOT.pc.s <- ITOT.c
+ITOT.pc.f <- xts(y.hat, order.by=index(ITOT.pc.s[T1:TT]))
+colnames(ITOT.pc.f) <- "forecast"
+
+colors <- c("Data"="springgreen4", "Forecast"="red") # set colors for plotted lines
+ggplot() + 
+  geom_line(data=ITOT.pc.s, aes(x=index(ITOT.pc.s), y=ITOT.Close, color="Data")) +
+  geom_line(data=ITOT.pc.f, aes(x=index(ITOT.pc.f), y=forecast, color="Forecast")) +
+  labs(x="Date", y="", title="Core S&P Total U.S. Stock Market, Close, % change") +
+  theme_minimal() + 
+  theme(plot.title = element_text(size=10)) +
+  theme(legend.position = c(0.1, 0.9)) +   
+  scale_color_manual(name="", values=colors)  +
+  scale_x_date(date_breaks="3 months", date_labels = "%Y-%m") 
+```
+
+# 3. Time Series Cross-validation for `nnetar()`
+
+Function for time-series cross-validation for nnetar()    
+Arguments: data set without testing set (class xts), nnetar parameters (p, P, size)    
+The data set will be split into training and validation set based on evaluation on a rolling forecasting origin    
+```{r}
+TSCV_nnetar <- function(data, p, P, size) {
+  TT <- length(data)
+  T1 <- floor(TT/5) # start at 20% of the sample size
+  step <- 20 # forecast horizon for MSE
+  MSE.t <- matrix(0,nrow=TT-T1+1,ncol=1) # initialize
+  y.hat <- MSE.t # initialize
+  tseq <- seq(from=T1, to=TT, by=step)
+  tseq <- tseq[-length(tseq)]
+  for (j in tseq) {
+    #print(j) # display progress through data
+    set.seed(seed)
+    nnetar.model <- nnetar(y=data[1:j-1], p=p, P=P, size=size) # fit nnetar model on the training set
+    NN.f <- forecast(nnetar.model,h=step) # generate forecast
+    y.hat <- as.numeric(NN.f$mean)
+    js <- j+step-1
+    MSE.t[(j-T1+1):(js-T1+1)] <- (as.numeric(data[j:js])-y.hat)^2
+  }
+  MSE.validation <- mean(MSE.t)
+  return(MSE.validation)
+}
+```
+
+Obtain time series validation MSE for a sequence of lags and `size=` parameters (number of hidden neurons) 
+```{r}
+size.max <- 8
+lag.max <- 10
+TSCV <- matrix(0, nrow=lag.max, ncol=size.max)
+for (s in 1:size.max) {
+  for (k in 1:lag.max) {
+    TSCV[k,s] <- TSCV_nnetar(data=ITOT.c, p=k, P=0, size=s)
+    #writeLines(paste("Size = ", s, "Lag = ", k, "  Validation MSE = ", TSCV[k,s]))
+  }}
+TSCV <- data.frame(TSCV)
+colnames(TSCV) <- paste("hn.", 1:size.max , sep="")
+```
+
+Plot validation MSE
+```{r, fig.width=7, fig.height=5}
+colors <- c("hidden.neurons.1"="blue", "hidden.neurons.2"="red", 
+            "hidden.neurons.3"="cyan", "hidden.neurons.4"="darkviolet",
+            "hidden.neurons.5"="darkgreen", "hidden.neurons.6"="gold",
+            "hidden.neurons.7"="pink", "hidden.neurons.8"="tan")
+ggplot() + 
+  geom_line(data=TSCV, aes(x=index(TSCV), y=hn.1, color="hidden.neurons.1")) +
+  geom_line(data=TSCV, aes(x=index(TSCV), y=hn.2, color="hidden.neurons.2")) +
+  geom_line(data=TSCV, aes(x=index(TSCV), y=hn.3, color="hidden.neurons.3")) +  
+  geom_line(data=TSCV, aes(x=index(TSCV), y=hn.4, color="hidden.neurons.4")) +  
+  geom_line(data=TSCV, aes(x=index(TSCV), y=hn.5, color="hidden.neurons.5")) +  
+  geom_line(data=TSCV, aes(x=index(TSCV), y=hn.6, color="hidden.neurons.6")) +
+  geom_line(data=TSCV, aes(x=index(TSCV), y=hn.7, color="hidden.neurons.7")) +  
+  geom_line(data=TSCV, aes(x=index(TSCV), y=hn.8, color="hidden.neurons.8")) +    
+  geom_point(data=TSCV, aes(x=index(TSCV), y=hn.1, color="hidden.neurons.1")) + 
+  geom_point(data=TSCV, aes(x=index(TSCV), y=hn.2, color="hidden.neurons.2")) +
+  geom_point(data=TSCV, aes(x=index(TSCV), y=hn.3, color="hidden.neurons.3")) +  
+  geom_point(data=TSCV, aes(x=index(TSCV), y=hn.4, color="hidden.neurons.4")) +  
+  geom_point(data=TSCV, aes(x=index(TSCV), y=hn.5, color="hidden.neurons.5")) +  
+  geom_point(data=TSCV, aes(x=index(TSCV), y=hn.6, color="hidden.neurons.6")) +
+  geom_point(data=TSCV, aes(x=index(TSCV), y=hn.7, color="hidden.neurons.7")) +    
+  geom_point(data=TSCV, aes(x=index(TSCV), y=hn.8, color="hidden.neurons.8")) +      
+  labs(x="Lag", y="", title="Time Series Validation MSE") +
+  theme_minimal() + 
+  theme(plot.title = element_text(size=10)) +
+  theme(legend.position = c(0.3, 0.75)) +   
+  scale_color_manual(name="", values=colors) + 
+  scale_x_continuous(breaks=index(TSCV), labels=paste(index(TSCV)))
+```
+
+Forecast with NNAR
+```{r, warning=FALSE}
+set.seed(seed)
+nnetar.model <- nnetar(y=data, p=5, P=0, size=4) # train the model on all data
+n.future <- 10 # set the forecast time horizon
+ITOT.c.f <- forecast(nnetar.model, h=n.future) # generate forecast
+id <- tk_index(ITOT.c) # extract time index from the data series
+id.f <- tk_make_future_timeseries(id, length_out=n.future, inspect_weekdays=TRUE) 
+ITOT.c.f <- xts(x=ITOT.c.f$mean, order.by=id.f) 
+colnames(ITOT.c.f)[1] <- "forecast"
+```
+
+Plot part of the original series and forecast
+```{r, fig.width=7, fig.height=3}
+start.plot <- as.Date("2023-02-01") # starting date for data plot
+ITOT.c.s <- window(ITOT.c, start=start.plot) # extract subset of data for plotting
+colors <- c("Data"="springgreen4", "Forecast"="red") # set colors for plotted lines
+
+ggplot() + 
+  geom_line(data=ITOT.c.s, aes(x=index(ITOT.c.s), y=ITOT.Close, color="Data")) +
+  geom_line(data=ITOT.c.f, aes(x=index(ITOT.c.f), y=forecast, color="Forecast")) +
+  labs(x="Date", y="", title="Core S&P Total U.S. Stock Market, Close") +
+  theme_minimal() + 
+  theme(plot.title = element_text(size=10)) +
+  theme(legend.position = c(0.15, 0.9)) +   
+  scale_color_manual(name="", values=colors)  +
+  scale_x_date(date_breaks="1 months", date_labels = "%Y-%m") 
+```
+
